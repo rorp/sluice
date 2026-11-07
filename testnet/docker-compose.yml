@@ -1,0 +1,27 @@
+# testnet3 bitcoind for running Sluice against Lightning Labs' testnet swap server (test.swap.lightning.today).
+# eclair runs on the host (see testnet.sh). Chain data is bind-mounted in .data/bitcoind (~200 GB with txindex).
+services:
+  bitcoind:
+    image: bitcoin/bitcoin:31.1
+    container_name: loop-testnet-bitcoind
+    restart: unless-stopped
+    command:
+      - "-testnet"
+      - "-txindex"
+      - "-printtoconsole"
+      - "-dbcache=2000"
+      - "-zmqpubhashblock=tcp://0.0.0.0:29332"
+      - "-zmqpubrawtx=tcp://0.0.0.0:29333"
+      - "-rpcport=18332"
+      - "-rpcbind=0.0.0.0"
+      - "-rpcallowip=0.0.0.0/0"
+      - "-rpcuser=eclair"
+      - "-rpcpassword=${TESTNET_RPC_PASSWORD:?run through testnet.sh}"
+      - "-rpcworkqueue=64"
+      - "-fallbackfee=0.0002"
+    volumes:
+      - ./.data/bitcoind:/home/bitcoin/.bitcoin
+    ports:
+      - "127.0.0.1:18332:18332"
+      - "127.0.0.1:29332:29332"
+      - "127.0.0.1:29333:29333"

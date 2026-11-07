@@ -1,0 +1,205 @@
+# Regtest environment for Sluice, adapted from lightninglabs/loop regtest/docker-compose.yml:
+#  - the official regtest loopserver image is no longer published, it is replaced by our own minimal server (./loopserver)
+#  - bitcoind is upgraded to Bitcoin Core 31 (required by eclair) and its RPC/ZMQ ports are exposed to the host
+#  - lndserver's p2p port is exposed so that an eclair node running on the host can open channels with it
+#  - lndclient/loopclient (loopd) are kept as a reference client for our server, eclair runs on the host
+services:
+  bitcoind:
+    image: bitcoin/bitcoin:31.1
+    container_name: loop-bitcoind
+    restart: unless-stopped
+    networks:
+      regtest:
+        aliases:
+          - bitcoind
+    command:
+      - "-txindex"
+      - "-regtest"
+      - "-rest"
+      - "-printtoconsole"
+      - "-zmqpubrawblock=tcp://0.0.0.0:28332"
+      - "-zmqpubrawtx=tcp://0.0.0.0:28333"
+      - "-zmqpubhashblock=tcp://0.0.0.0:28334"
+      - "-rpcport=18443"
+      - "-rpcbind=0.0.0.0"
+      # This is just the hashed string "lightning" with a salt.
+      - "-rpcauth=lightning:8492220e715bbfdf5f165102bfd7ed4$$88090545821ed5e9db614588c0afbad575ccc14681fb77f3cae6899bc419af67"
+      - "-rpcallowip=0.0.0.0/0"
+      - "-rpcworkqueue=64"
+      - "-fallbackfee=0.0002"
+      - "-consolidatefeerate=0"
+      - "-peerblockfilters=1"
+      - "-blockfilterindex=1"
+    volumes:
+      - bitcoind:/home/bitcoin/.bitcoin
+    ports:
+      - "18443:18443"
+      - "28332:28332"
+      - "28333:28333"
+      - "28334:28334"
+
+  lndserver:
+    image: lightninglabs/lnd:v0.21.0-beta
+    container_name: loop-lndserver
+    restart: unless-stopped
+    networks:
+      regtest:
+        aliases:
+          - lndserver
+    volumes:
+      - "lndserver:/root/.lnd"
+    depends_on:
+      - bitcoind
+    command:
+      - "--logdir=/root/.lnd"
+      - "--alias=lndserver"
+      - "--rpclisten=0.0.0.0:10009"
+      - "--listen=0.0.0.0:9735"
+      - "--noseedbackup"
+      - "--bitcoin.active"
+      - "--bitcoin.regtest"
+      - "--bitcoin.node=bitcoind"
+      - "--bitcoind.rpchost=bitcoind"
+      - "--bitcoind.rpcuser=lightning"
+      - "--bitcoind.rpcpass=lightning"
+      - "--bitcoind.zmqpubrawblock=tcp://bitcoind:28332"
+      - "--bitcoind.zmqpubrawtx=tcp://bitcoind:28333"
+      - "--debuglevel=debug"
+      - "--externalip=lndserver"
+      - "--tlsextradomain=lndserver"
+    ports:
+      - "9735:9735"
+
+  loopserver:
+    build: ./loopserver
+    image: eclair-loop/regtestloopserver
+    container_name: loop-loopserver
+    restart: unless-stopped
+    networks:
+      regtest:
+        aliases:
+          - loopserver
+    volumes:
+      - "lndserver:/root/.lnd:ro"
+      - "loopserver:/root/loopserver"
+    depends_on:
+      - lndserver
+    command:
+      - "--listen=0.0.0.0:11009"
+      - "--tlsdir=/root/loopserver"
+      - "--lnd.host=lndserver:10009"
+      - "--lnd.dir=/root/.lnd"
+      - "--maxamt=5000000"
+      - "--nocoopsweep=${LOOPSERVER_NO_COOP_SWEEP:-false}"
+      - "--loopoutcltvextra=${LOOPSERVER_LOOPOUT_CLTV_EXTRA:-30}"
+    ports:
+      - "11009:11009"
+
+  aperture:
+    build:
+      context: https://github.com/lightninglabs/aperture.git
+      dockerfile: Dockerfile
+      args:
+        checkout: v0.3.8-beta
+    container_name: loop-aperture
+    restart: unless-stopped
+    depends_on:
+      - loopserver
+      - etcd
+    networks:
+      regtest:
+        aliases:
+          - aperture
+    volumes:
+      - "lndserver:/root/.lnd"
+      - "loopserver:/root/loopserver"
+      - "aperture:/root/.aperture"
+    ports:
+      - "11018:11018"
+    entrypoint: [ "/bin/aperture" ]
+    command:
+      - "--configfile=/root/.aperture/aperture.yaml"
+
+  lndclient:
+    image: lightninglabs/lnd:v0.21.0-beta
+    container_name: loop-lndclient
+    restart: unless-stopped
+    networks:
+      regtest:
+        aliases:
+          - lndclient
+    volumes:
+      - "lndclient:/root/.lnd"
+    depends_on:
+      - bitcoind
+    command:
+      - "--logdir=/root/.lnd"
+      - "--alias=lndclient"
+      - "--rpclisten=0.0.0.0:10009"
+      - "--noseedbackup"
+      - "--bitcoin.active"
+      - "--bitcoin.regtest"
+      - "--bitcoin.node=bitcoind"
+      - "--bitcoind.rpchost=bitcoind"
+      - "--bitcoind.rpcuser=lightning"
+      - "--bitcoind.rpcpass=lightning"
+      - "--bitcoind.zmqpubrawblock=tcp://bitcoind:28332"
+      - "--bitcoind.zmqpubrawtx=tcp://bitcoind:28333"
+      - "--debuglevel=debug"
+      - "--externalip=lndclient"
+      - "--tlsextradomain=lndclient"
+
+  loopclient:
+    build:
+      context: https://github.com/lightninglabs/loop.git#fd3ed6cf4f71d9e914c9a6082be160203bcd8787
+      dockerfile: Dockerfile
+    image: eclair-loop/loopd
+    container_name: loop-loopclient
+    restart: unless-stopped
+    networks:
+      regtest:
+        aliases:
+          - loopclient
+    volumes:
+      - "lndclient:/root/.lnd"
+      - "aperture:/root/.aperture:ro"
+      - "loopclient:/root/.loop"
+    depends_on:
+      - aperture
+      - lndclient
+    command:
+      - "loopd"
+      - "--network=regtest"
+      - "--debuglevel=debug"
+      - "--server.host=aperture:11018"
+      - "--server.tlspath=/root/.aperture/tls.cert"
+      - "--lnd.host=lndclient:10009"
+      - "--lnd.macaroonpath=/root/.lnd/data/chain/bitcoin/regtest/admin.macaroon"
+      - "--lnd.tlspath=/root/.lnd/tls.cert"
+
+  # bitnami/etcd (used upstream) is no longer published on docker hub.
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.17
+    container_name: loop-etcd
+    hostname: etcd
+    networks:
+      regtest:
+        aliases:
+          - etcd
+    restart: unless-stopped
+    command:
+      - "etcd"
+      - "--data-dir=/etcd-data"
+      - "--listen-client-urls=http://0.0.0.0:2379"
+      - "--advertise-client-urls=http://etcd:2379"
+
+networks:
+  regtest:
+
+volumes:
+  bitcoind:
+  lndserver:
+  lndclient:
+  loopserver:
+  loopclient:
+  aperture:
