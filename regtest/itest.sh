@@ -370,7 +370,6 @@ ALL_TESTS=(
   loop_out_reorg
   loop_out_reorg_before_reveal
   loop_out_abandon
-  loop_out_first_hop
   api_errors
   loop_in_key_path
   loop_in_eclair_restart

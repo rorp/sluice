@@ -17,15 +17,36 @@ externally funded loop ins, Tor.
 
 ## Build and install
 
-Requires Eclair 0.14.6 with the `firstHop` payment parameter (ACINQ/eclair#3407, not in Eclair's releases: the plugin
-fails with `NoSuchMethodError` when paying with an Eclair build that doesn't have it) in the local Maven repository
-(`mvn install -pl eclair-core,eclair-node -am -DskipTests` in the Eclair repo), and Eclair's bitcoind wallet (the plugin
-refuses to start with another on-chain wallet). Build against another version with `-Declair.version=<version>`.
+Sluice is built against Eclair 0.14.6, which must be in the local Maven repository:
 
 ```sh
+git clone https://github.com/ACINQ/eclair.git
+
+cd eclair/
+
+git checkout v0.14.6
+
+mvn install -DskipTests=true
+```
+
+Then build the plugin:
+
+```sh
+git clone https://github.com/rorp/sluice.git
+
+cd sluice/
+
 mvn package
+```
+
+To run it, pass the jar to Eclair, which must use its bitcoind wallet (the plugin refuses to start with another
+on-chain wallet):
+
+```sh
 eclair-node.sh <path-to>/sluice_2.13-0.1.0-SNAPSHOT.jar
 ```
+
+Build against another version with `-Declair.version=<version>`.
 
 The jar is shaded: it bundles grpc-java (with shaded netty) and relocated copies of guava and protobuf.
 
@@ -68,7 +89,7 @@ call the server every block and every minute: use `loopfetchl402` to buy one soo
 |---|---|---|
 | `loopoutterms` | | Server limits for loop out (amounts, cltv delta) |
 | `loopoutquote` | `amountSat`, `confTarget` (default 9), `fast` | Swap fee, prepay amount and htlc expiry |
-| `loopout` | `amountSat`, `confTarget`, `fast`, `address`, `maxSwapFeeSat`, `maxPrepayAmountSat`, `maxMinerFeeSat`, `maxSwapRoutingFeeSat`, `maxPrepayRoutingFeeSat`, `htlcConfirmations`, `firstHop`, `idempotencyKey` | Starts a loop out to `address` (default: a new Eclair wallet address); `firstHop` is the channel we pay the server through |
+| `loopout` | `amountSat`, `confTarget`, `fast`, `address`, `maxSwapFeeSat`, `maxPrepayAmountSat`, `maxMinerFeeSat`, `maxSwapRoutingFeeSat`, `maxPrepayRoutingFeeSat`, `htlcConfirmations`, `idempotencyKey` | Starts a loop out to `address` (default: a new Eclair wallet address) |
 | `loopinterms` | | Server limits for loop in |
 | `loopinquote` | `amountSat`, `lastHop`, `confTarget` (default 6, at most 1008), `routeHints` | Swap fee, cltv delta and estimated htlc fee (the server first probes our node) |
 | `loopin` | `amountSat`, `confTarget`, `lastHop`, `address`, `maxSwapFeeSat`, `maxMinerFeeSat`, `routeHints`, `idempotencyKey` | Starts a loop in; `address` receives the refund if the server doesn't pay (default: a new Eclair wallet address) |
@@ -162,14 +183,6 @@ htlc amount (like loopd), since the alternative is losing all of it. Keep Eclair
 A reorg that removes the server's htlc after we revealed the preimage lets the server take our payment and double-spend
 its htlc. We sweep any other htlc that the server publishes for our swap, but for large swaps you should wait for more
 confirmations before revealing the preimage, with `htlcConfirmations` (`loop-out-htlc-confirmations` by default).
-
-To loop out the balance of a given channel, set `firstHop` to its real scid (`800000x1x0`) or local alias
-(`0x1b865d25d5a34f4`), as shown by `eclair-cli channels`: we pay both the swap and the prepay invoices through that
-channel only, like loopd's `--channel` (but with a single channel). The swap shows the id that Eclair's router uses for
-the channel: its real scid if it is announced, its local alias otherwise. The swap is refused if the channel isn't open and online, or can't send the swap amount
-plus fee: our payments stay pending until we reveal the preimage, so they must fit both in its balance and in the value
-of htlcs in flight that our peer accepts (`max_htlc_value_in_flight_msat`). If the channel goes offline before we pay
-(after a restart), we wait for it.
 
 ### Loop In
 

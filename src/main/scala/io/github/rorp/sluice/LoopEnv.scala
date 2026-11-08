@@ -215,7 +215,7 @@ class EclairLoopPayments(kit: Kit, paymentTimeout: FiniteDuration = 1.minute)(im
   override def pay(invoice: Bolt11Invoice, maxFee: Satoshi, firstHop_opt: Option[ShortChannelId]): Future[UUID] = {
     implicit val timeout: Timeout = Timeout(paymentTimeout)
     // The proportional limit is 0 so that the flat limit applies (eclair uses the max of both).
-    eclair.send(Some(EclairLoopPayments.ExternalId), invoice.amount_opt.get, invoice, maxFeeFlat_opt = Some(maxFee), maxFeePct_opt = Some(0), firstHop_opt = firstHop_opt)
+    eclair.send(Some(EclairLoopPayments.ExternalId), invoice.amount_opt.get, invoice, maxFeeFlat_opt = Some(maxFee), maxFeePct_opt = Some(0))
   }
 
   override def status(paymentHash: ByteVector32, failureFinal: Boolean): SwapPaymentStatus =

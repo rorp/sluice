@@ -47,9 +47,9 @@ object LoopRoutes {
     val loopOut: Route = postRequest("loopout") { implicit t =>
       formFields("amountSat".as[Satoshi], "confTarget".as[Int].?, "fast".as[Boolean].?, "address".?,
         "maxSwapFeeSat".as[Satoshi].?, "maxPrepayAmountSat".as[Satoshi].?, "maxMinerFeeSat".as[Satoshi].?,
-        "maxSwapRoutingFeeSat".as[Satoshi].?, "maxPrepayRoutingFeeSat".as[Satoshi].?, "htlcConfirmations".as[Int].?, "firstHop".as[ShortChannelId](scidOrAliasUnmarshaller).?, "idempotencyKey".?) {
-        (amount, confTarget_opt, fast_opt, address_opt, maxSwapFee_opt, maxPrepayAmount_opt, maxMinerFee_opt, maxSwapRoutingFee_opt, maxPrepayRoutingFee_opt, htlcConfirmations_opt, firstHop_opt, idempotencyKey_opt) =>
-          completeOrError(manager.loopOut(LoopOutRequest(amount, confTarget_opt, fast_opt.getOrElse(false), address_opt, maxSwapFee_opt, maxPrepayAmount_opt, maxMinerFee_opt, maxSwapRoutingFee_opt, maxPrepayRoutingFee_opt, htlcConfirmations_opt, firstHop_opt, idempotencyKey_opt)))
+        "maxSwapRoutingFeeSat".as[Satoshi].?, "maxPrepayRoutingFeeSat".as[Satoshi].?, "htlcConfirmations".as[Int].?, "idempotencyKey".?) {
+        (amount, confTarget_opt, fast_opt, address_opt, maxSwapFee_opt, maxPrepayAmount_opt, maxMinerFee_opt, maxSwapRoutingFee_opt, maxPrepayRoutingFee_opt, htlcConfirmations_opt, idempotencyKey_opt) =>
+          completeOrError(manager.loopOut(LoopOutRequest(amount, confTarget_opt, fast_opt.getOrElse(false), address_opt, maxSwapFee_opt, maxPrepayAmount_opt, maxMinerFee_opt, maxSwapRoutingFee_opt, maxPrepayRoutingFee_opt, htlcConfirmations_opt, firstHop_opt = None, idempotencyKey_opt)))
       }
     }
 
