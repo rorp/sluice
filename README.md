@@ -11,9 +11,8 @@ It is a port of `loopd`'s swap logic (`lightninglabs/loop` at `fd3ed6c`, protoco
 cooperative spends) running inside Eclair, using Eclair's payments, invoices and bitcoind wallet.
 
 **Status: alpha.** Swaps work end-to-end on regtest against a swap server built from loop's own packages
-(`regtest/loopserver`), including the failure paths. They have **not yet run against Lightning Labs' server**, which is
-closed source: test on testnet with small amounts first. Not supported: autoloop, static addresses, sweep batching,
-externally funded loop ins, Tor.
+(`regtest/loopserver`), including the failure paths. They have run against Lightning Labs' testnet server, which is
+closed source. Not supported: autoloop, static addresses, sweep batching, externally funded loop ins, Tor.
 
 ## Build and install
 
