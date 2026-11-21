@@ -17,8 +17,13 @@ import io.grpc.inprocess.{InProcessChannelBuilder, InProcessServerBuilder}
 import org.scalatest.funsuite.AnyFunSuite
 import scodec.bits.ByteVector
 
+import fr.acinq.eclair.NotificationsLogger
+import fr.acinq.eclair.NotificationsLogger.NotifyNodeOperator
+
 import java.sql.DriverManager
 import java.util.UUID
+import java.util.concurrent.ConcurrentLinkedQueue
+import scala.jdk.CollectionConverters.CollectionHasAsScala
 import scala.concurrent.duration.DurationInt
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.jdk.CollectionConverters.ListHasAsScala
@@ -31,8 +36,11 @@ class LoopInSpec extends AnyFunSuite {
 
   private val config = SluiceConfig("in-process", ServerTls.Insecure, "sluice/v0.1.0-test", 10 seconds, maxL402Cost = 1000 sat, maxL402RoutingFee = 10 sat, l402PaymentTimeout = 10 seconds, l402MinPurchaseInterval = 1 hour, defaultSweepConfTarget = 9, loopOutHtlcConfirmations = 1, maxSwapFeePpm = 20_000, maxPrepay = 30_000 sat)
 
-  case class Fixture(server: FakeSwapServer, chain: FakeLoopChain, payments: FakeLoopPayments, db: FlakyLoopDb, manager: SwapManager, env: SwapEnv, keys: LoopKeys) {
+  case class Fixture(server: FakeSwapServer, chain: FakeLoopChain, payments: FakeLoopPayments, db: FlakyLoopDb, manager: SwapManager, env: SwapEnv, keys: LoopKeys, notifications: ConcurrentLinkedQueue[NotifyNodeOperator]) {
     @volatile var spawned = Seq.empty[LoopIn.Swap]
+
+    /** The notifications sent to the node operator, as (severity, message) pairs. */
+    def notified(): Seq[(NotificationsLogger.Severity, String)] = notifications.asScala.toSeq.map(n => (n.severity, n.message))
 
     def processor(): LoopInProcessor = new LoopInProcessor(env)
 
@@ -58,13 +66,15 @@ class LoopInSpec extends AnyFunSuite {
     val chain = new FakeLoopChain(BlockHeight(800_000))
     val payments = new FakeLoopPayments()
     val keys = new LoopKeys(randomBytes32().bytes)
-    val env = SwapEnv(client, chain, payments, db, keys, Block.RegtestGenesisBlock.hash)
+    val notifications = new ConcurrentLinkedQueue[NotifyNodeOperator]()
+    val notifier = new SwapNotifier(config.notifications, notifications.add(_))
+    val env = SwapEnv(client, chain, payments, db, keys, Block.RegtestGenesisBlock.hash, notifier)
     var fixture: Fixture = null
     val manager = new SwapManager(client, db, config, randomKey().publicKey, chain, payments, keys, Block.RegtestGenesisBlock.hash, {
       case swap: LoopIn.Swap => fixture.spawned = fixture.spawned :+ swap
       case _ => ()
-    })
-    fixture = Fixture(server, chain, payments, db, manager, env, keys)
+    }, notifier = notifier)
+    fixture = Fixture(server, chain, payments, db, manager, env, keys, notifications)
     try {
       test(fixture)
     } finally {
@@ -229,6 +239,38 @@ class LoopInSpec extends AnyFunSuite {
       assert(info.amountReceived.contains(MilliSatoshi(995_000_000)))
       assert(info.htlcTxFee.contains(1525.sat))
       assert(info.htlcOutPoint.contains(s"${htlcTx.txid}:1"))
+    }
+  }
+
+  test("notify the node operator of each state transition") {
+    withFixture { f =>
+      val processor = startSwap(f)
+      val swapHash = f.swap().swapHash
+      f.chain.mine()
+      assert(serverPays(f))
+      // A single step can go through several states: we notify each of them.
+      f.server.pushedKeys.clear()
+      f.chain.mine(serverSuccessSweep(f))
+      assert(await(processor.step(f.swap())).state == States.Success)
+      assert(f.notified() == Seq(
+        (NotificationsLogger.Info, s"sluice: loop in $swapHash: created (INITIATED)"),
+        (NotificationsLogger.Info, s"sluice: loop in $swapHash: INITIATED -> HTLC_PUBLISHED"),
+        (NotificationsLogger.Info, s"sluice: loop in $swapHash: HTLC_PUBLISHED -> INVOICE_SETTLED"),
+        (NotificationsLogger.Info, s"sluice: loop in $swapHash: INVOICE_SETTLED -> SUCCESS"),
+      ))
+    }
+  }
+
+  test("notify a refund as a warning") {
+    withFixture { f =>
+      val processor = startSwap(f)
+      f.chain.mine()
+      f.chain.mineEmpty((f.swap().cltvExpiry - f.chain.height).toInt)
+      assert(await(processor.step(f.swap())).progress.refundTxs.size == 1)
+      f.chain.mine()
+      f.chain.mineEmpty(LoopIn.RefundMinDepth - 1)
+      assert(await(processor.step(f.swap())).state == States.FailedTimeout)
+      assert(f.notified().last == (NotificationsLogger.Warning, s"sluice: loop in ${f.swap().swapHash}: HTLC_PUBLISHED -> FAILED_TIMEOUT: the server didn't pay us: our htlc was refunded"))
     }
   }
 

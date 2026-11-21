@@ -17,8 +17,13 @@ import io.grpc.inprocess.{InProcessChannelBuilder, InProcessServerBuilder}
 import org.scalatest.funsuite.AnyFunSuite
 import ch.qos.logback.{classic => logback}
 
+import fr.acinq.eclair.NotificationsLogger
+import fr.acinq.eclair.NotificationsLogger.NotifyNodeOperator
+
 import java.sql.DriverManager
 import java.util.UUID
+import java.util.concurrent.ConcurrentLinkedQueue
+import scala.jdk.CollectionConverters.CollectionHasAsScala
 import scala.concurrent.duration.DurationInt
 import scala.concurrent.{Await, ExecutionContext, Future, Promise}
 
@@ -28,8 +33,11 @@ class LoopOutSpec extends AnyFunSuite {
 
   private val config = SluiceConfig("in-process", ServerTls.Insecure, "sluice/v0.1.0-test", 10 seconds, maxL402Cost = 1000 sat, maxL402RoutingFee = 10 sat, l402PaymentTimeout = 10 seconds, l402MinPurchaseInterval = 1 hour, defaultSweepConfTarget = 9, loopOutHtlcConfirmations = 1, maxSwapFeePpm = 20_000, maxPrepay = 30_000 sat)
 
-  case class Fixture(server: FakeSwapServer, chain: FakeLoopChain, payments: FakeLoopPayments, db: FlakyLoopDb, manager: SwapManager, env: SwapEnv) {
+  case class Fixture(server: FakeSwapServer, chain: FakeLoopChain, payments: FakeLoopPayments, db: FlakyLoopDb, manager: SwapManager, env: SwapEnv, notifications: ConcurrentLinkedQueue[NotifyNodeOperator]) {
     @volatile var spawned = Seq.empty[LoopOut.Swap]
+
+    /** The notifications sent to the node operator, as (severity, message) pairs. */
+    def notified(): Seq[(NotificationsLogger.Severity, String)] = notifications.asScala.toSeq.map(n => (n.severity, n.message))
 
     def processor(feerateStep: FeeratePerKw = LoopOut.SweepFeerateStep): LoopOutProcessor = new LoopOutProcessor(env, feerateStep)
 
@@ -52,13 +60,15 @@ class LoopOutSpec extends AnyFunSuite {
     val chain = new FakeLoopChain(BlockHeight(800_000))
     val payments = new FakeLoopPayments()
     val keys = new LoopKeys(randomBytes32().bytes)
-    val env = SwapEnv(client, chain, payments, db, keys, Block.RegtestGenesisBlock.hash)
+    val notifications = new ConcurrentLinkedQueue[NotifyNodeOperator]()
+    val notifier = new SwapNotifier(config.notifications, notifications.add(_))
+    val env = SwapEnv(client, chain, payments, db, keys, Block.RegtestGenesisBlock.hash, notifier)
     var fixture: Fixture = null
     val manager = new SwapManager(client, db, config, randomKey().publicKey, chain, payments, keys, Block.RegtestGenesisBlock.hash, {
       case swap: LoopOut.Swap => fixture.spawned = fixture.spawned :+ swap
       case _ => ()
-    })
-    fixture = Fixture(server, chain, payments, db, manager, env)
+    }, notifier = notifier)
+    fixture = Fixture(server, chain, payments, db, manager, env, notifications)
     try {
       test(fixture)
     } finally {
@@ -359,6 +369,70 @@ class LoopOutSpec extends AnyFunSuite {
       val info = f.manager.getSwap(swap1.swapHash).get
       assert(info.loopOut.get.minerFee.contains(fee(f, sweep)))
       assert(info.loopOut.get.sweepTxIds == Seq(sweep.txid))
+    }
+  }
+
+  test("notify the node operator of each state transition") {
+    withFixture { f =>
+      val processor = startSwap(f)
+      val swapHash = f.swap().swapHash
+      publishHtlc(f)
+      assert(await(processor.step(f.swap())).state == States.PreimageRevealed)
+      // Steps that don't change the state don't notify.
+      assert(await(processor.step(f.swap())).state == States.PreimageRevealed)
+      f.chain.mine()
+      f.chain.mineEmpty(LoopOut.SweepMinDepth - 1)
+      assert(await(processor.step(f.swap())).state == States.Success)
+      assert(f.notified() == Seq(
+        (NotificationsLogger.Info, s"sluice: loop out $swapHash: created (INITIATED)"),
+        (NotificationsLogger.Info, s"sluice: loop out $swapHash: INITIATED -> PREIMAGE_REVEALED"),
+        (NotificationsLogger.Info, s"sluice: loop out $swapHash: PREIMAGE_REVEALED -> SUCCESS"),
+      ))
+    }
+  }
+
+  test("notify failures as warnings, and failures that lose funds as errors") {
+    withFixture { f =>
+      val processor = startSwap(f)
+      f.payments.statuses.put(f.swap().swapHash, SwapPaymentStatus.Failed)
+      assert(await(processor.step(f.swap())).state == States.FailedOffchainPayments)
+      assert(f.notified().last == (NotificationsLogger.Warning, s"sluice: loop out ${f.swap().swapHash}: INITIATED -> FAILED_OFFCHAIN_PAYMENTS: our swap payment failed"))
+    }
+    withFixture { f =>
+      val processor = startSwap(f)
+      val htlcTx = publishHtlc(f)
+      assert(await(processor.step(f.swap())).state == States.PreimageRevealed)
+      f.chain.clearMempool()
+      val serverSweep = Transaction(2, Seq(TxIn(f.swap().progress.htlc_opt.get.outPoint, Nil, 0)), Seq(htlcTx.txOut(1).copy(amount = 990_000 sat)), 0)
+      f.chain.mine(serverSweep)
+      f.chain.mineEmpty(LoopOut.SweepMinDepth - 1)
+      assert(await(processor.step(f.swap())).state == States.FailedSweepTimeout)
+      assert(f.notified().last == (NotificationsLogger.Error, s"sluice: loop out ${f.swap().swapHash}: PREIMAGE_REVEALED -> FAILED_SWEEP_TIMEOUT: the server reclaimed its htlc after we revealed the preimage"))
+    }
+  }
+
+  test("only notify the configured states") {
+    withConfig(config.copy(notifications = NotificationsConfig(loopOutStates = Set(States.FailedAbandoned), loopInStates = LoopIn.States.all.toSet))) { f =>
+      val processor = startSwap(f)
+      assert(f.notified().isEmpty)
+      assert(processor.abandon(f.swap()).isRight)
+      assert(f.notified() == Seq((NotificationsLogger.Warning, s"sluice: loop out ${f.swap().swapHash}: INITIATED -> FAILED_ABANDONED: abandoned by the user")))
+    }
+    withConfig(config.copy(notifications = NotificationsConfig.Disabled)) { f =>
+      val processor = startSwap(f)
+      publishHtlc(f)
+      assert(await(processor.step(f.swap())).state == States.PreimageRevealed)
+      assert(f.notified().isEmpty)
+    }
+  }
+
+  test("a failure to notify doesn't fail the swap") {
+    withFixture { f =>
+      val processor = new LoopOutProcessor(f.env.copy(notifier = new SwapNotifier(NotificationsConfig.All, _ => throw new RuntimeException("event stream is down"))))
+      assert(await(f.manager.loopOut(LoopOutRequest(1_000_000 sat))).state == States.Initiated)
+      assert(await(processor.step(f.swap())).state == States.Initiated)
+      publishHtlc(f)
+      assert(await(processor.step(f.swap())).state == States.PreimageRevealed)
     }
   }
 

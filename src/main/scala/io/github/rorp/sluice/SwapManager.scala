@@ -260,6 +260,7 @@ object SwapManager {
  *
  * @param spawn          starts the state machine of a swap.
  * @param abandonRunning asks the state machine of a running swap to abandon it: replies with the reason why it can't.
+ * @param notifier       reports new swaps to the node operator.
  */
 class SwapManager(server: SwapServerClient,
                   db: LoopDb,
@@ -270,7 +271,8 @@ class SwapManager(server: SwapServerClient,
                   keys: LoopKeys,
                   chainHash: BlockHash,
                   spawn: SwapLike => Unit,
-                  abandonRunning: ByteVector32 => Future[Either[String, SwapRecord]] = _ => Future.successful(Left("swap isn't running")))(implicit ec: ExecutionContext) extends Logging {
+                  abandonRunning: ByteVector32 => Future[Either[String, SwapRecord]] = _ => Future.successful(Left("swap isn't running")),
+                  notifier: SwapNotifier = SwapNotifier.Disabled)(implicit ec: ExecutionContext) extends Logging {
 
   import SwapManager._
 
@@ -487,6 +489,7 @@ class SwapManager(server: SwapServerClient,
         val record = SwapRecord(swapHash, SwapType.LoopOut, LoopOut.States.Initiated, request.amount, preimage, keyIndex, quote.cltvExpiry, LoopOutData.encode(data), now, now, requestId_opt)
         db.addSwap(record)
         if (response.serverMessage.nonEmpty) logger.info(s"loop out $swapHash: server message: ${response.serverMessage}")
+        notifier.stateChanged(record, None)
         spawn(LoopOut.Swap(record, data))
         swapInfo(record)
       }
@@ -676,6 +679,7 @@ class SwapManager(server: SwapServerClient,
           persisted match {
             case Success((record, data)) =>
               if (response.serverMessage.nonEmpty) logger.info(s"loop in $swapHash: server message: ${response.serverMessage}")
+              notifier.stateChanged(record, None)
               spawn(LoopIn.Swap(record, data))
               Future.successful(swapInfo(record))
             case Failure(t) =>

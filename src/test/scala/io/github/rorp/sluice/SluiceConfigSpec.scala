@@ -22,6 +22,34 @@ class SluiceConfigSpec extends AnyFunSuite {
     // Defaults.
     assert(config.userAgent == "sluice/v0.1.0-alpha/eclair=0.14.6")
     assert(config.maxPrepay == 30_000.sat)
+    assert(config.notifications == NotificationsConfig.All)
+  }
+
+  test("read the states to notify") {
+    val eclairConfig = ConfigFactory.parseString(
+      """
+        |sluice {
+        |  server = "localhost:11009"
+        |  notifications {
+        |    loop-out-states = [PREIMAGE_REVEALED, success, FAILED_SWEEP_TIMEOUT]
+        |    loop-in-states = []
+        |  }
+        |}
+        |""".stripMargin)
+    val config = SluiceConfig(eclairConfig, Block.RegtestGenesisBlock.hash, "0.14.6")
+    assert(config.notifications == NotificationsConfig(Set("PREIMAGE_REVEALED", "SUCCESS", "FAILED_SWEEP_TIMEOUT"), Set.empty))
+  }
+
+  test("refuse unknown states to notify") {
+    val eclairConfig = ConfigFactory.parseString(
+      """
+        |sluice {
+        |  server = "localhost:11009"
+        |  notifications.loop-in-states = [SUCCESS, PREIMAGE_REVEALED]
+        |}
+        |""".stripMargin)
+    val e = intercept[IllegalArgumentException](SluiceConfig(eclairConfig, Block.RegtestGenesisBlock.hash, "0.14.6"))
+    assert(e.getMessage.contains("invalid sluice.notifications.loop-in-states: unknown states PREIMAGE_REVEALED"))
   }
 
   test("use Lightning Labs' server by default on testnet") {

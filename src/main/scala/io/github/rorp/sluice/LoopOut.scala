@@ -49,6 +49,7 @@ object LoopOut {
     val FailedInvalid = "FAILED_INVALID"
     /** The user abandoned the swap before we revealed the preimage. */
     val FailedAbandoned = "FAILED_ABANDONED"
+    val all: Seq[String] = Seq(Initiated, PreimageRevealed, Success, FailedOffchainPayments, FailedTimeout, FailedIncorrectHtlcAmount, FailedSweepTimeout, FailedInvalid, FailedAbandoned)
   }
   // @formatter:on
 
@@ -142,21 +143,29 @@ class LoopOutProcessor(env: SwapEnv, feerateStep: FeeratePerKw = LoopOut.SweepFe
     case _ => Future.successful(swap)
   }
 
-  private def update(swap: Swap, state: String, progress: LoopOutProgress): Swap = {
+  /** @param notice_opt why the swap failed, if it did, for the node operator's notification (see [[fail]]). */
+  private def update(swap: Swap, state: String, progress: LoopOutProgress, notice_opt: Option[String] = None): Swap = {
     if (state != swap.state || progress != swap.progress) {
       if (state != swap.state) log(swap, s"${swap.state} -> $state")
       val data = swap.data.copy(progress = progress)
       val now = TimestampMilli.now()
       env.db.updateSwap(swap.swapHash, state, LoopOutData.encode(data), now)
-      swap.copy(record = swap.record.copy(state = state, contract = LoopOutData.encode(data), updatedAt = now), data = data)
+      val swap1 = swap.copy(record = swap.record.copy(state = state, contract = LoopOutData.encode(data), updatedAt = now), data = data)
+      if (state != swap.state) env.notifier.stateChanged(swap1.record, Some(swap.state), notice_opt)
+      swap1
     } else {
       swap
     }
   }
 
-  private def fail(swap: Swap, state: String, reason: String): Swap = {
+  /**
+   * @param reason logged with the swap's details.
+   * @param notice notified to the node operator: a fixed description, without amounts, txids or other data about the
+   *               swap.
+   */
+  private def fail(swap: Swap, state: String, reason: String, notice: String): Swap = {
     logger.warn(s"swap ${swap.swapHash}: failed: $reason")
-    update(swap, state, swap.progress)
+    update(swap, state, swap.progress, Some(notice))
   }
 
   // --- Paying the server and waiting for its htlc ---
@@ -211,13 +220,13 @@ class LoopOutProcessor(env: SwapEnv, feerateStep: FeeratePerKw = LoopOut.SweepFe
       val swapStatus = paymentStatus(swap.swapHash)
       val prepayStatus = paymentStatus(prepayHash(swap))
       if (swapStatus == SwapPaymentStatus.Failed || prepayStatus == SwapPaymentStatus.Failed) {
-        val swap1 = fail(swap, States.FailedOffchainPayments, s"payment failed (swap=$swapStatus prepay=$prepayStatus)")
+        val swap1 = fail(swap, States.FailedOffchainPayments, s"payment failed (swap=$swapStatus prepay=$prepayStatus)", s"our ${if (swapStatus == SwapPaymentStatus.Failed) "swap" else "prepay"} payment failed")
         cancelSwap(swap1, prepay = swapStatus != SwapPaymentStatus.Failed)
       } else {
         findHtlc(swap, height).flatMap { swap1 =>
           swap1.progress.htlc_opt match {
             case None if height >= swap.cltvExpiry - MinPreimageRevealDelta =>
-              Future.successful(fail(swap1, States.FailedTimeout, s"htlc not found before height ${swap.cltvExpiry - MinPreimageRevealDelta}"))
+              Future.successful(fail(swap1, States.FailedTimeout, s"htlc not found before height ${swap.cltvExpiry - MinPreimageRevealDelta}", "the server's htlc wasn't found in time to reveal the preimage"))
             case None => Future.successful(swap1)
             case Some(htlcOutput) => checkHtlc(swap1, htlcOutput, height)
           }
@@ -244,7 +253,7 @@ class LoopOutProcessor(env: SwapEnv, feerateStep: FeeratePerKw = LoopOut.SweepFe
   override def abandon(swap: Swap): Either[String, Swap] = swap.state match {
     // We haven't revealed the preimage: the server can't take our swap payment, which will fail back to us once its
     // htlc expires (we lose the prepay if the server already settled it).
-    case States.Initiated => Right(fail(swap, States.FailedAbandoned, "abandoned by the user"))
+    case States.Initiated => Right(fail(swap, States.FailedAbandoned, "abandoned by the user", "abandoned by the user"))
     case States.PreimageRevealed => Left("the preimage has been revealed: the htlc must be swept, the swap can't be abandoned")
     case state => Left(s"swap is already final ($state)")
   }
@@ -302,10 +311,10 @@ class LoopOutProcessor(env: SwapEnv, feerateStep: FeeratePerKw = LoopOut.SweepFe
         log(swap, s"htlc ${htlcOutput.outPoint.txid} isn't confirmed anymore")
         Future.successful(update(swap, swap.state, rescan(swap)))
       case Some(_) if htlcOutput.txOut.amount < swap.amount =>
-        Future.successful(fail(swap, States.FailedIncorrectHtlcAmount, s"htlc amount ${htlcOutput.txOut.amount} is below swap amount ${swap.amount}"))
+        Future.successful(fail(swap, States.FailedIncorrectHtlcAmount, s"htlc amount ${htlcOutput.txOut.amount} is below swap amount ${swap.amount}", "the server's htlc pays less than the swap amount"))
       case Some(confirmations) if confirmations < swap.contract.htlcConfirmations => Future.successful(swap)
       case Some(_) if height >= swap.cltvExpiry - MinPreimageRevealDelta =>
-        Future.successful(fail(swap, States.FailedTimeout, s"too late to reveal the preimage (height=$height expiry=${swap.cltvExpiry})"))
+        Future.successful(fail(swap, States.FailedTimeout, s"too late to reveal the preimage (height=$height expiry=${swap.cltvExpiry})", "too late to reveal the preimage"))
       case Some(_) if revealSweepFee(swap) > maxSweepFee(swap, htlcOutput, urgent = false) =>
         // Like loopd, we don't reveal the preimage if we can't sweep within our limits: the server could then take our
         // payment while our sweep doesn't confirm. We wait for feerates to drop, or we give up at the reveal deadline
@@ -405,7 +414,7 @@ class LoopOutProcessor(env: SwapEnv, feerateStep: FeeratePerKw = LoopOut.SweepFe
           log(swap, s"sweep ${tx.txid} confirmed (amount=${tx.txOut.map(_.amount).sum})")
           update(swap, States.Success, swept(swap, tx))
         } else {
-          fail(swap, States.FailedSweepTimeout, s"htlc was spent by ${tx.txid}")
+          fail(swap, States.FailedSweepTimeout, s"htlc was spent by ${tx.txid}", "the server reclaimed its htlc after we revealed the preimage")
         }
       case Some((tx, _)) =>
         log(swap, s"htlc was spent by ${tx.txid}, waiting for it to be deeply confirmed")

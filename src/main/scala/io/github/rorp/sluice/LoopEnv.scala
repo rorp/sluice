@@ -28,8 +28,12 @@ import scala.concurrent.duration.{DurationInt, FiniteDuration}
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.Try
 
-/** What swaps need to run. */
-case class SwapEnv(server: SwapServerClient, chain: LoopChain, payments: LoopPayments, db: LoopDb, keys: LoopKeys, chainHash: BlockHash)
+/**
+ * What swaps need to run.
+ *
+ * @param notifier reports state transitions to the node operator.
+ */
+case class SwapEnv(server: SwapServerClient, chain: LoopChain, payments: LoopPayments, db: LoopDb, keys: LoopKeys, chainHash: BlockHash, notifier: SwapNotifier = SwapNotifier.Disabled)
 
 /** A block of our best chain: its parent tells us whether it extends the blocks we already looked at. */
 case class ChainBlock(blockId: BlockId, parentId: BlockId, txs: Seq[Transaction])

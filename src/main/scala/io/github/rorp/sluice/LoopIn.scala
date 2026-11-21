@@ -42,6 +42,7 @@ object LoopIn {
     val FailedInsufficientFunds = "FAILED_INSUFFICIENT_FUNDS"
     /** The user abandoned the swap before we published our htlc. */
     val FailedAbandoned = "FAILED_ABANDONED"
+    val all: Seq[String] = Seq(Initiated, HtlcPublished, InvoiceSettled, Success, FailedTimeout, FailedInsufficientFunds, FailedAbandoned)
   }
   // @formatter:on
 
@@ -126,21 +127,29 @@ class LoopInProcessor(env: SwapEnv)(implicit ec: ExecutionContext) extends SwapP
     }
   }
 
-  private def update(swap: Swap, state: String, progress: LoopInProgress): Swap = {
+  /** @param notice_opt why the swap failed, if it did, for the node operator's notification (see [[fail]]). */
+  private def update(swap: Swap, state: String, progress: LoopInProgress, notice_opt: Option[String] = None): Swap = {
     if (state != swap.state || progress != swap.progress) {
       if (state != swap.state) log(swap, s"${swap.state} -> $state")
       val data = swap.data.copy(progress = progress)
       val now = TimestampMilli.now()
       env.db.updateSwap(swap.swapHash, state, LoopInData.encode(data), now)
-      swap.copy(record = swap.record.copy(state = state, contract = LoopInData.encode(data), updatedAt = now), data = data)
+      val swap1 = swap.copy(record = swap.record.copy(state = state, contract = LoopInData.encode(data), updatedAt = now), data = data)
+      if (state != swap.state) env.notifier.stateChanged(swap1.record, Some(swap.state), notice_opt)
+      swap1
     } else {
       swap
     }
   }
 
-  private def fail(swap: Swap, state: String, reason: String): Swap = {
+  /**
+   * @param reason logged with the swap's details.
+   * @param notice notified to the node operator: a fixed description, without amounts, txids or other data about the
+   *               swap.
+   */
+  private def fail(swap: Swap, state: String, reason: String, notice: String): Swap = {
     logger.warn(s"swap ${swap.swapHash}: failed: $reason")
-    update(swap, state, swap.progress)
+    update(swap, state, swap.progress, Some(notice))
   }
 
   private def isPaid(swap: Swap): Boolean = env.payments.incomingStatus(swap.swapHash) match {
@@ -160,7 +169,7 @@ class LoopInProcessor(env: SwapEnv)(implicit ec: ExecutionContext) extends SwapP
   }
 
   override def abandon(swap: Swap): Either[String, Swap] = swap.state match {
-    case States.Initiated if removeInvoice(swap) => Right(fail(swap, States.FailedAbandoned, "abandoned by the user"))
+    case States.Initiated if removeInvoice(swap) => Right(fail(swap, States.FailedAbandoned, "abandoned by the user", "abandoned by the user"))
     case States.Initiated => Left("the server already paid us")
     case States.HtlcPublished => Left("our htlc is published: it will be refunded automatically after its expiry if the server doesn't pay us")
     case States.InvoiceSettled => Left("the server already paid us")
@@ -171,14 +180,14 @@ class LoopInProcessor(env: SwapEnv)(implicit ec: ExecutionContext) extends SwapP
 
   private def publishHtlc(swap: Swap, height: BlockHeight): Future[Swap] = {
     if (swap.cltvExpiry - height < MinLoopInPublishDelta) {
-      if (removeInvoice(swap)) Future.successful(fail(swap, States.FailedTimeout, s"too late to publish the htlc (height=$height expiry=${swap.cltvExpiry})"))
+      if (removeInvoice(swap)) Future.successful(fail(swap, States.FailedTimeout, s"too late to publish the htlc (height=$height expiry=${swap.cltvExpiry})", "too late to publish our htlc"))
       else Future.successful(swap)
     } else {
       val htlc = LoopIn.htlc(swap, env.keys)
       val feerate = env.chain.feerate(swap.contract.htlcConfTarget)
       env.chain.fundOutput(htlc.pubkeyScriptBytes, swap.amount, feerate, swap.contract.limits.maxMinerFee).transformWith {
         case Failure(t) =>
-          if (removeInvoice(swap)) Future.successful(fail(swap, States.FailedInsufficientFunds, s"cannot fund htlc: ${t.getMessage}"))
+          if (removeInvoice(swap)) Future.successful(fail(swap, States.FailedInsufficientFunds, s"cannot fund htlc: ${t.getMessage}", "eclair's wallet couldn't fund our htlc"))
           else Future.successful(swap)
         case Success((tx, fee)) =>
           // The server can only pay us while our invoice exists. It may have been deleted (with eclair's deleteinvoice,
@@ -189,7 +198,7 @@ class LoopInProcessor(env: SwapEnv)(implicit ec: ExecutionContext) extends SwapP
               // We persist our htlc before publishing it, so that we can always refund it.
               Try(update(swap, States.HtlcPublished, swap.progress.copy(htlcTx_opt = Some(tx), htlcTxFee = fee)))
             case false =>
-              Success(fail(swap, States.FailedAbandoned, "our invoice was deleted before we published our htlc"))
+              Success(fail(swap, States.FailedAbandoned, "our invoice was deleted before we published our htlc", "our invoice was deleted before we published our htlc"))
           } match {
             case Success(swap1) if swap1.state == States.HtlcPublished =>
               lastPublishHeight_opt = Some(height)
@@ -242,7 +251,7 @@ class LoopInProcessor(env: SwapEnv)(implicit ec: ExecutionContext) extends SwapP
             isDoubleSpent(htlcTx).map {
               case true if removeInvoice(swap) =>
                 env.chain.rollback(htlcTx).failed.foreach(t => logger.warn(s"swap ${swap.swapHash}: cannot unlock htlc inputs: ${t.getMessage}"))
-                fail(swap, States.FailedTimeout, "htlc was double-spent before it confirmed")
+                fail(swap, States.FailedTimeout, "htlc was double-spent before it confirmed", "our htlc was double-spent before it confirmed")
               case true => swap
               case false =>
                 logger.warn(s"swap ${swap.swapHash}: our htlc ${htlcTx.txid} expired before it confirmed: we'll refund it if it confirms")
@@ -273,7 +282,7 @@ class LoopInProcessor(env: SwapEnv)(implicit ec: ExecutionContext) extends SwapP
       swap1 <- refunds.find(_._2 > 0) match {
         case Some((tx, confirmations)) if confirmations >= RefundMinDepth =>
           log(swap, s"refund ${tx.txid} confirmed (amount=${tx.txOut.head.amount})")
-          Future.successful(update(swap, States.FailedTimeout, refunded(swap, tx)))
+          Future.successful(update(swap, States.FailedTimeout, refunded(swap, tx), Some("the server didn't pay us: our htlc was refunded")))
         case Some(_) => Future.successful(swap)
         case None if !htlcSpendable => htlcSpent(swap, htlcOutput, htlcConfirmations, height)
         case None if lastPublishHeight_opt.contains(height) => Future.successful(swap)
@@ -289,7 +298,7 @@ class LoopInProcessor(env: SwapEnv)(implicit ec: ExecutionContext) extends SwapP
       case Some((tx, spentAt)) if tx.txOut.forall(_.publicKeyScript == swap.contract.refundScript) =>
         if ((height - spentAt).toInt + 1 >= RefundMinDepth) {
           log(swap, s"refund ${tx.txid} confirmed (amount=${tx.txOut.map(_.amount).sum})")
-          update(swap, States.FailedTimeout, refunded(swap, tx))
+          update(swap, States.FailedTimeout, refunded(swap, tx), Some("the server didn't pay us: our htlc was refunded"))
         } else swap
       case Some(_) =>
         // Only the server can have spent it, with the preimage: it paid us and we'll see it at the next step.

@@ -6,6 +6,7 @@ import fr.acinq.bitcoin.scalacompat.{Block, BlockHash, Satoshi, SatoshiLong}
 import java.io.File
 import java.util.concurrent.TimeUnit
 import scala.concurrent.duration.{DurationLong, FiniteDuration}
+import scala.jdk.CollectionConverters.ListHasAsScala
 
 sealed trait ServerTls
 
@@ -38,6 +39,7 @@ object ServerTls {
  *                              the user set its max swap fee.
  * @param maxPrepay             we refuse a loop out whose quoted prepay (which the server can take without doing the
  *                              swap) is above this, unless the user set its max prepay amount.
+ * @param notifications         swap state transitions that we report to the node operator.
  */
 case class SluiceConfig(serverAddress: String,
                       tls: ServerTls,
@@ -50,7 +52,8 @@ case class SluiceConfig(serverAddress: String,
                       defaultSweepConfTarget: Int,
                       loopOutHtlcConfirmations: Int,
                       maxSwapFeePpm: Long,
-                      maxPrepay: Satoshi) {
+                      maxPrepay: Satoshi,
+                      notifications: NotificationsConfig = NotificationsConfig.All) {
 
   def maxSwapFee(amount: Satoshi): Satoshi = amount * maxSwapFeePpm / 1_000_000
 
@@ -70,7 +73,7 @@ object SluiceConfig {
   // DefaultSweepConfTarget, loopdb.DefaultLoopOutHtlcConfirmations, and autoloop's defaultSwapFeePPM and
   // defaultMaximumPrepay for limits that the user didn't set).
   val fallback: Config = ConfigFactory.parseString(
-    """
+    s"""
       |sluice {
       |  // server = "host:port" (defaults to the Lightning Labs server on mainnet and testnet3, required on other chains)
       |  tls = "system" // system | file | insecure
@@ -85,6 +88,10 @@ object SluiceConfig {
       |  loop-out-htlc-confirmations = 1
       |  max-swap-fee-ppm = 5000
       |  max-prepay-sat = 30000
+      |  notifications {
+      |    loop-out-states = [${LoopOut.States.all.mkString(", ")}]
+      |    loop-in-states = [${LoopIn.States.all.mkString(", ")}]
+      |  }
       |}
       |""".stripMargin)
 
@@ -122,7 +129,18 @@ object SluiceConfig {
       loopOutHtlcConfirmations = c.getInt("loop-out-htlc-confirmations"),
       maxSwapFeePpm = c.getLong("max-swap-fee-ppm"),
       maxPrepay = c.getLong("max-prepay-sat").sat,
+      notifications = NotificationsConfig(
+        loopOutStates = notifiedStates(c, "notifications.loop-out-states", LoopOut.States.all),
+        loopInStates = notifiedStates(c, "notifications.loop-in-states", LoopIn.States.all),
+      ),
     )
+  }
+
+  private def notifiedStates(c: Config, path: String, known: Seq[String]): Set[String] = {
+    val states = c.getStringList(path).asScala.map(_.toUpperCase).toSet
+    val unknown = states -- known
+    require(unknown.isEmpty, s"invalid sluice.$path: unknown states ${unknown.mkString(", ")} (expected some of ${known.mkString(", ")})")
+    states
   }
 
 }

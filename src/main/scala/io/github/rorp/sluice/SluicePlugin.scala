@@ -1,5 +1,6 @@
 package io.github.rorp.sluice
 
+import akka.actor.typed.eventstream.EventStream
 import akka.actor.typed.scaladsl.AskPattern.Askable
 import akka.actor.typed.scaladsl.Behaviors
 import akka.actor.typed.scaladsl.adapter.ClassicActorSystemOps
@@ -56,7 +57,9 @@ class SluicePlugin extends Plugin with RouteProvider with Logging {
     val chain = new BitcoinCoreLoopChain(kit, bitcoin)
     val payments = new EclairLoopPayments(kit)
     val keys = LoopKeys.fromNodeKey(nodeParams.privateKey)
-    val env = SwapEnv(server, chain, payments, db, keys, nodeParams.chainHash)
+    // eclair's NotificationsLogger writes these events to its notifications log.
+    val notifier = new SwapNotifier(config.notifications, n => kit.system.toTyped.eventStream ! EventStream.Publish(n))
+    val env = SwapEnv(server, chain, payments, db, keys, nodeParams.chainHash, notifier)
     // Running swaps, so that we can send them commands (they're removed once they stop).
     val running = new ConcurrentHashMap[ByteVector32, ActorRef[SwapActor.Command]]()
     val spawn: SwapLike => Unit = { swap =>
@@ -84,7 +87,7 @@ class SluicePlugin extends Plugin with RouteProvider with Logging {
         actor.ask[Either[String, SwapRecord]](SwapActor.Abandon)
       case None => Future.successful(Left("swap isn't running"))
     }
-    manager = new SwapManager(server, db, config, nodeParams.nodeId, chain, payments, keys, nodeParams.chainHash, spawn, abandonRunning)
+    manager = new SwapManager(server, db, config, nodeParams.nodeId, chain, payments, keys, nodeParams.chainHash, spawn, abandonRunning, notifier)
     manager.resumeSwaps()
     kit.system.registerOnTermination {
       server.close()

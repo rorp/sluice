@@ -70,6 +70,24 @@ eclair.sluice {
   loop-out-htlc-confirmations = 1 // confirmations of the server's htlc before we reveal the preimage (loopd's default)
   max-swap-fee-ppm = 5000   // swap fee limit when a swap doesn't set maxSwapFeeSat (0.5% of the amount)
   max-prepay-sat = 30000    // prepay limit when a loop out doesn't set maxPrepayAmountSat
+  // Swap states that we report to the node operator when a swap enters them (all of them by default, [] for none)
+  notifications {
+    loop-out-states = [INITIATED, PREIMAGE_REVEALED, SUCCESS, FAILED_OFFCHAIN_PAYMENTS, FAILED_TIMEOUT, FAILED_INCORRECT_HTLC_AMOUNT, FAILED_SWEEP_TIMEOUT, FAILED_INVALID, FAILED_ABANDONED]
+    loop-in-states = [INITIATED, HTLC_PUBLISHED, INVOICE_SETTLED, SUCCESS, FAILED_TIMEOUT, FAILED_INSUFFICIENT_FUNDS, FAILED_ABANDONED]
+  }
+}
+```
+
+Each swap state transition (including the creation of a swap, in `INITIATED`) whose new state is in these lists is
+published as an Eclair `NotifyNodeOperator` event: Eclair writes it to its notifications log (the `notifications`
+logger), and other plugins can subscribe to it on the event stream. Failures are warnings, except those where we may
+have lost funds (`FAILED_SWEEP_TIMEOUT`, `FAILED_INVALID`), which are errors. For example, to only hear about loop
+outs that revealed the preimage, and about failures:
+
+```hocon
+eclair.sluice.notifications {
+  loop-out-states = [PREIMAGE_REVEALED, FAILED_OFFCHAIN_PAYMENTS, FAILED_TIMEOUT, FAILED_INCORRECT_HTLC_AMOUNT, FAILED_SWEEP_TIMEOUT, FAILED_INVALID]
+  loop-in-states = [FAILED_TIMEOUT, FAILED_INSUFFICIENT_FUNDS]
 }
 ```
 
