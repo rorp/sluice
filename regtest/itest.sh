@@ -286,9 +286,14 @@ function route_through() {
   api findroutetonode "nodeId=$(lndserver getinfo | jq -r .identity_pubkey)" "amountMsat=$(($2 * 1000))" "firstHop=$1" | jq -e '.routes | length > 0' > /dev/null
 }
 
+# The real scid of the channel that can send less, of the two given.
+function smaller_channel() {
+  if [ "$(can_send "$1")" -le "$(can_send "$2")" ]; then echo "$1"; else echo "$2"; fi
+}
+
 # eclair has two channels with the server's node: we loop out through each of them, by real scid and by alias.
 function test_loop_out_first_hop() {
-  local channels scid1 scid2 alias2 start h
+  local channels scid1 scid2 alias2 small start h
   channels=$(api channels | jq -c '[.[] | {scid: .data.lastAnnouncement_opt.shortChannelId, alias: .data.aliases.localAlias}]')
   scid1=$(jq -r '.[0].scid' <<< "$channels")
   scid2=$(jq -r '.[1].scid' <<< "$channels")
@@ -296,7 +301,14 @@ function test_loop_out_first_hop() {
   check "eclair can send 400000 sat through $scid1" refill_channel "$scid1" 400000 &&
     check "eclair can send 400000 sat through $scid2" refill_channel "$scid2" 400000 &&
     check "an unknown first hop is refused" api_fails_with "first hop 1x2x3 isn't one of our open channels" loopout amountSat=500000 firstHop=1x2x3 &&
-    check "a first hop that can't send the swap amount is refused" api_fails_with "our channel $scid1 can only send" loopout "amountSat=$(($(can_send "$scid1") / 1000))" "firstHop=$scid1" || return 1
+    small=$(smaller_channel "$scid1" "$scid2") || return 1
+  # Looping out a channel's whole balance must fail on our first hop check, not on the server's max swap amount: we
+  # use the channel that can send less (eclair lists channels in any order, and loop ins refill them).
+  if [ $(($(can_send "$small") / 1000)) -le "$(api loopoutterms | jq .maxSwapAmount)" ]; then
+    check "a first hop that can't send the swap amount is refused" api_fails_with "our channel $small can only send" loopout "amountSat=$(($(can_send "$small") / 1000))" "firstHop=$small" || return 1
+  else
+    log "  skipped: a first hop that can't send the swap amount is refused (both channels can send more than the server's max swap amount)"
+  fi
   start=$(date +%s)
   h=$(loop_out amountSat=250000 fast=true "firstHop=$scid1") &&
     check "first hop $scid1 in swap info" [ "$(api loopswapinfo "swapHash=$h" | jq -r .loopOut.firstHop)" = "$scid1" ] &&
